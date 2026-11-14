@@ -1,0 +1,23 @@
+# Cache do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Arquivos gerados, PDFs de teste e pastas de dados
+*.xlsx
+~$*.xlsx
+*.pdf
+DATALUTA*/
+dbg/
+
+# Sistema operacional / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

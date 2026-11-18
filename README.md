@@ -1,11 +1,11 @@
-# Extrator de links e metadados de PDFs 
+# Extrator de Links e Metadados de PDFs
 
-Script em Python para ler pastas de PDFs de notícias, extrair automaticamente **título, fonte, data de publicação, URL/domínio, autor e tags**, e gerar uma planilha Excel (`.xlsx`) organizada com resumo por pasta.
+Script em Python para ler pastas de PDFs de notícias, extrair automaticamente **título, fonte, data/hora de publicação e URL**, e gerar uma planilha Excel (`.xlsx`) organizada com resumo por pasta.
 
 ## Requisitos
 
 1. **Python 3.10+**
-2. Bibliotecas Python:
+2. **Bibliotecas Python:**
    ```bash
    pip install pymupdf pandas openpyxl pytesseract pillow
    ```
@@ -14,31 +14,40 @@ Script em Python para ler pastas de PDFs de notícias, extrair automaticamente *
      ```powershell
      winget install UB-Mannheim.TesseractOCR
      ```
+     *(Marque o idioma **Portuguese** durante a instalação)*
    - **Linux:**
      ```bash
      sudo apt install tesseract-ocr tesseract-ocr-por
      ```
+4. **Ollama (SLM Local)** — **Recomendado** para desempatar links de matérias sem rodapé e preencher metadados faltantes:
+   - Instale o [Ollama](https://ollama.com/) (ou via terminal no Windows: `winget install Ollama.Ollama`).
+   - Baixe um modelo leve (ex.: `qwen2.5:3b` ou `llama3.2:3b`):
+     ```bash
+     ollama pull qwen2.5:3b
+     ```
+   - Certifique-se de que o Ollama está rodando em segundo plano (`http://localhost:11434`) antes de executar o script.
 
 ## Como usar
 
-Baixar a pasta principal (incluindo todas as subpastas):
+**Com o SLM local ativado (recomendado):**
+```bash
+python extrair_links.py "PASTA_COM_PDFS" saida.xlsx --modelo-slm qwen2.5:3b
+```
+
+**Sem SLM local (apenas regras e OCR):**
 ```bash
 python extrair_links.py "PASTA_COM_PDFS" saida.xlsx
 ```
 
-Testar com um único arquivo PDF:
+**Testar com um único arquivo PDF:**
 ```bash
-python extrair_links.py noticia.pdf teste.xlsx
+python extrair_links.py noticia.pdf teste.xlsx --modelo-slm qwen2.5:3b
 ```
-
 
 ## O que a planilha gerada contém
 
 - **Aba `Notícias`:**
-  - Código, pasta (e subníveis `pasta_1`, `pasta_2`, `pasta_3`), título, fonte, data/hora de publicação e data de impressão.
-  - Link clicável da notícia (`url`) e origem da extração (`rodapé do PDF`, `rodapé (OCR)`, `link de compartilhamento`, `link da página`, `domínio do site` ou `imagem (OCR)`).
-  - Link direto para abrir o arquivo PDF local (`caminho_pdf`).
-  - Coluna `avisos` sinalizando URLs cortadas, duplicadas ou campos que precisam de conferência manual.
+  - `codigo`, `pasta` (e subníveis `pasta_1`, `pasta_2`, `pasta_3`), `titulo`, `fonte`, `data_publicacao` e `hora_publicacao`.
+  - Link clicável da notícia (`url`) e origem da extração (`url_origem`: `rodapé do PDF`, `rodapé + título (...)`, `rodapé (OCR)`, `link de compartilhamento`, `link da página`, `link da página (SLM)`, `imagem (OCR)` ou `home do site`).
 - **Aba `Resumo`:**
-  - Total de PDFs, quantos têm URL, quantos ficaram sem URL e quantos possuem avisos em cada pasta.
-
+  - Total de PDFs, quantos têm URL (`com_url`) e quantos ficaram sem URL (`sem_url`) em cada pasta.

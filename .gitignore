@@ -9,7 +9,6 @@ venv/
 env/
 
 # Arquivos gerados, PDFs de teste e pastas de dados
-*.xlsx
 ~$*.xlsx
 *.pdf
 DATALUTA*/

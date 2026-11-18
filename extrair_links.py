@@ -9,14 +9,18 @@ Uso:
     python extrair_links.py PASTA_COM_PDFS noticias.xlsx
     python extrair_links.py UM_ARQUIVO.pdf teste.xlsx
     python extrair_links.py PASTA noticias.xlsx --debug-ocr dbg
+    python extrair_links.py PASTA noticias.xlsx --modelo-slm qwen2.5:3b
 """
 import argparse
 import difflib
+import json
 import os
 import re
 import shutil
 import sys
 import unicodedata
+import urllib.error
+import urllib.request
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -27,11 +31,35 @@ import pymupdf
 
 NOMES_FONTE = {
     "agenciabrasil.ebc.com.br": "Agência Brasil",
-    "g1.globo.com": "G1",
     "cienciadoleite.com.br": "Ciência do Leite",
     "folha.uol.com.br": "Folha de S.Paulo",
-    "campograndenews.com.br": "Campo Grande News",
     "poder360.com.br": "Poder360",
+    "soundcloud.com": "SoundCloud",
+    "ifpa.edu.br": "IFPA",
+    "anovademocracia.com.br": "A Nova Democracia",
+    "mab.org.br": "MAB – Movimento dos Atingidos por Barragens",
+    "correiodecarajas.com.br": "Correio de Carajás",
+    "brasildefato.com.br": "Brasil de Fato",
+    "cptnacional.org.br": "CPT – Comissão Pastoral da Terra",
+    "metropoles.com": "Metrópoles",
+    "fup.org.br": "FUP – Federação Única dos Petroleiros",
+    "seculodiario.com.br": "Século Diário",
+    "saibamais.jor.br": "Saiba Mais",
+    "dw.com": "Deutsche Welle",
+    "g1.globo.com": "G1",
+    "apublica.org": "Agência Pública",
+    "saulovale.com.br": "Saulo Vale",
+    "vgnoticias.com.br": "VGN",
+    "campograndenews.com.br": "Campo Grande News",
+    "amazoniabrasilradioweb.com.br": "Amazônia Brasil Rádio Web",
+    "sorriso.mt.gov.br": "Prefeitura de Sorriso",
+    "mpf.mp.br": "MPF – Ministério Público Federal",
+    "didigalvao.com.br": "Blog do Didi Galvão",
+    "progressive.international": "Progressive International",
+    "noticiapreta.com.br": "Notícia Preta",
+    "racismoambiental.net.br": "Combate Racismo Ambiental",
+    "causaoperaria.org.br": "Diário Causa Operária",
+    "reporterbrasil.org.br": "Repórter Brasil",
 }
 
 MESES = {
@@ -54,6 +82,11 @@ OCR_VARIANTES = (("cinza", "--psm 6"), ("binaria", "--psm 6"), ("cinza", "--psm 
 CONF_BOA = 85
 
 DEBUG = {"dir": None, "pdf": ""}
+SLM = {
+    "modelo": "",
+    "url": os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate"),
+    "timeout": 20,
+}
 
 RE_PUB_NUM = re.compile(
     r"(?:Publicad[oa]|Postad[oa])(?:\s+em)?:?\s*(\d{1,2})/(\d{1,2})/(\d{2,4})"
@@ -69,7 +102,7 @@ RE_IMPRESSAO = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4}),?\s+(\d{1,2}):(\d{2}
 RE_URL_ANO_MES = re.compile(r"/(20\d{2})[-/](\d{2})(?:[-/](\d{2}))?(?:/|$)")
 RE_NOME_ARQUIVO = re.compile(r"^(\d{2})(\d{2})(\d{2})[A-Za-z]")  # ddmmaa + letras
 
-_TLDS = r"(?:com|org|net|gov|edu|mp|leg|jus|jor|ind|agr|inf|art|mil|coop|imb|b|tv|fm|news|info|gg|me|io)"
+_TLDS = r"(?:com|org|net|gov|edu|mp|leg|jus|jor|ind|agr|inf|art|mil|coop|imb|b|tv|fm|news|info|gg|me|io|international)"
 RE_URL_OCR = re.compile(
     rf"^(?:https?:/{{1,2}}\S+|www\.\S+"
     rf"|[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:{_TLDS}(?:\.br)?|br)(?:/\S*)?)$",
@@ -78,6 +111,89 @@ RE_URL_OCR = re.compile(
 RE_PARECE_LINK = re.compile(rf":/|/\bwww\.|\.(?:{_TLDS}|br)\b", re.IGNORECASE)
 RE_INICIO_URL = re.compile(r"^(?:https?:/{1,2}|www\.)", re.IGNORECASE)
 RE_RESTO_URL = re.compile(r"^[A-Za-z0-9\-._~%/?=&#+:@]{3,}$")
+
+_DOMINIOS_IGNORAR = (
+    "doubleclick.net", "googleadservices.com", "adssettings.google.com", "google.com",
+    "googleapis.com", "gstatic.com", "googleusercontent.com", "googlesyndication.com",
+    "googletagmanager.com", "google-analytics.com", "g.co", "catarse.me", "livepix.gg",
+    "paypal.com", "whatsapp.com", "t.me", "twitter.com", "x.com", "facebook.com",
+    "fb.com", "youtube.com", "youtu.be", "linkedin.com", "bsky.app", "pinterest.com",
+    "tiktok.com", "instagram.com", "creativecommons.org", "lojadoand.com.br",
+    "mobister.com.br", "ajor.org.br",
+)
+
+_PADROES_URL_INVALIDA = re.compile(
+    r"(?:^https?:/{1,2}(?:accounts|mail|drive|docs)\.google\."
+    r"|/(?:signin|login|logout|auth|oauth|sharer|share|intent/tweet|wp-login|wp-admin|feed|rss)(?:\.php\b|/|\?|$|#))",
+    re.IGNORECASE,
+)
+
+_IGNORAR_CAMINHOS_PADRAO = re.compile(
+    r"^/(?:sobre|quem-somos|contato|expediente|assine|apoie|doe|contribua|"
+    r"categoria|categorias|category|tag|tags|editoria|editorias|autor|autores|author|"
+    r"colunista|colunistas|topico|tudo-sobre|ultimas-noticias|noticias-do-rn-e-nordeste|"
+    r"radioagencia|programas|especial|tipo|editorial|organizacoes-|personalidades-|"
+    r"brasil/[a-z-]+/?$|busca|search|ouvidoria/?$|politica-de-privacidade|politica-privacidade|"
+    r"transparencia|denuncie-e-seja-uma-fonte|republique|"
+    r"(?:ba|ce|df|mg|pa|pb|pe|pr|rj|rn|rs|sp)/?$)(?:/|\?|$)",
+    re.IGNORECASE,
+)
+
+
+def _perfil(padrao: str, reconstruir_slug: bool = True, ignorar: re.Pattern = _IGNORAR_CAMINHOS_PADRAO) -> dict:
+    return {
+        "padrao_artigo": re.compile(padrao, re.IGNORECASE),
+        "reconstruir_slug": reconstruir_slug,
+        "ignorar_caminhos": ignorar,
+    }
+
+
+PERFIS_FONTES = {
+    "soundcloud.com": _perfil(
+        r"^/(?!discover|stream|signin|login|upload|search|settings|you|pages|charts)[a-z0-9_-]+/[a-z0-9_-]+",
+        reconstruir_slug=False,
+    ),
+    "ifpa.edu.br": _perfil(r"/(?:noticias|comunicacao|ultimas-noticias)/.+|/[a-z0-9-]{20,}"),
+    "anovademocracia.com.br": _perfil(r"/(?:20\d{2}/\d{2}/|[a-z0-9-]{15,}/?$)"),
+    "mab.org.br": _perfil(r"/(?:noticias/|20\d{2}/\d{2}/|[a-z0-9-]{15,}/?$)"),
+    "correiodecarajas.com.br": _perfil(r"/(?:[a-z0-9-]+/)?[a-z0-9-]{15,}/?$"),
+    "brasildefato.com.br": _perfil(r"/(?:20\d{2}/\d{2}/\d{2}/|podcast/.+/\d{4}/\d{2}/\d{2}/)[a-z0-9-]{10,}"),
+    "cptnacional.org.br": _perfil(r"/(?:publicacoes|noticias|mural|pastoral)/.+|/\d+-[a-z0-9-]{10,}"),
+    "metropoles.com": _perfil(r"/(?:20\d{2}/\d{2}/|[a-z0-9-]+/[a-z0-9-]{15,})"),
+    "fup.org.br": _perfil(r"/[a-z0-9-]{15,}/?$"),
+    "seculodiario.com.br": _perfil(r"/(?:[a-z0-9-]+/)?[a-z0-9-]{15,}/?$"),
+    "saibamais.jor.br": _perfil(r"/(?:20\d{2}/\d{2}/|[a-z0-9-]{15,}/?$)"),
+    "dw.com": _perfil(r"/pt-br/.+/a-\d+", reconstruir_slug=False),
+    "g1.globo.com": _perfil(r"/(?:noticia|post)/20\d{2}/\d{2}/\d{2}/.+\.ghtml", reconstruir_slug=False),
+    "apublica.org": _perfil(r"/20\d{2}/\d{2}/[a-z0-9-]{10,}"),
+    "saulovale.com.br": _perfil(r"/(?:20\d{2}/\d{2}/(?:\d{2}/)?[a-z0-9-]{10,}|[a-z0-9-]{15,}/?$)"),
+    "vgnoticias.com.br": _perfil(r"/(?:[a-z0-9-]+/)?[a-z0-9-]{15,}"),
+    "campograndenews.com.br": _perfil(r"/(?:noticia|[a-z0-9-]+)/[a-z0-9-]{15,}"),
+    "amazoniabrasilradioweb.com.br": _perfil(r"/(?:noticias/|[a-z0-9-]{15,}/?$)"),
+    "sorriso.mt.gov.br": _perfil(r"/(?:noticia|noticias|comunicacao|imprensa)/.+|/[a-z0-9-]{20,}"),
+    "mpf.mp.br": _perfil(r"/(?:noticias|sala-de-imprensa|comunicacao)/.+|/[a-z0-9-]{20,}"),
+    "didigalvao.com.br": _perfil(r"/(?:20\d{2}/\d{2}/|[a-z0-9-]{15,}/?$)"),
+    "progressive.international": _perfil(r"/(?:wire|briefing|article)/.+"),
+    "noticiapreta.com.br": _perfil(r"/(?:20\d{2}/\d{2}/|[a-z0-9-]{15,}/?$)"),
+    "racismoambiental.net.br": _perfil(r"/20\d{2}/\d{2}/(?:\d{2}/)?[a-z0-9-]{10,}"),
+    "causaoperaria.org.br": _perfil(r"/20\d{2}/[a-z0-9-]{10,}"),
+    "reporterbrasil.org.br": _perfil(r"/20\d{2}/\d{2}/[a-z0-9-]{10,}"),
+}
+
+
+def obter_perfil_fonte(dom: str) -> dict | None:
+    if not dom:
+        return None
+    for d, p in PERFIS_FONTES.items():
+        if dom == d or dom.endswith("." + d):
+            return p
+    return None
+
+
+def nome_fonte_dominio(dom: str) -> str:
+    if not dom:
+        return ""
+    return next((n for d, n in NOMES_FONTE.items() if dom == d or dom.endswith("." + d)), "")
 
 
 def natural(s: str):
@@ -96,10 +212,9 @@ def pasta_relativa(pdf_path: Path, raiz: Path) -> str:
     return "" if str(rel) == "." else str(rel)
 
 
-def linha_base(pdf_path: Path, raiz: Path, paginas="") -> dict:
+def linha_base(pdf_path: Path, raiz: Path) -> dict:
     pasta = pasta_relativa(pdf_path, raiz)
-    return {"codigo": pdf_path.stem, "arquivo": pdf_path.name, "pasta": pasta,
-            **niveis_pasta(pasta), "paginas": paginas, "caminho_pdf": str(pdf_path.resolve())}
+    return {"codigo": pdf_path.stem, "pasta": pasta, **niveis_pasta(pasta)}
 
 
 RE_CONTROLE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -167,6 +282,34 @@ def listar_pdfs(raiz: Path):
     return sorted(achados, key=lambda p: chave_pdf(p, raiz))
 
 
+def extrair_dominio(url: str) -> str:
+    if not url:
+        return ""
+    u = re.sub(r"^(https?):/+", r"\1://", url.strip())
+    if "://" not in u:
+        u = "https://" + u
+    return urlparse(u).netloc.lower().removeprefix("www.")
+
+
+def url_valida(u: str, permitir_instagram: bool = False) -> bool:
+    if not u:
+        return False
+    limpa = limpar_token(u.strip())
+    if not limpa or _PADROES_URL_INVALIDA.search(limpa):
+        return False
+    dom = extrair_dominio(limpa)
+    if not dom or "." not in dom:
+        return False
+    if dom == "soundcloud.com" or dom.endswith(".soundcloud.com"):
+        u_parse = urlparse(limpa if "://" in limpa else "https://" + limpa)
+        return bool(PERFIS_FONTES["soundcloud.com"]["padrao_artigo"].search(u_parse.path or ""))
+    if permitir_instagram and (dom == "instagram.com" or dom.endswith(".instagram.com")):
+        return bool(re.search(r"/(?:p|reel)/[A-Za-z0-9_-]+", limpa))
+    if any(dom == d or dom.endswith("." + d) for d in _DOMINIOS_IGNORAR):
+        return False
+    return True
+
+
 def ler_cabecalho(page):
     blocos = [b for b in page.get_text("blocks") if b[3] < 40]
     linhas = [norm(l) for b in blocos for l in b[4].splitlines() if l.strip()]
@@ -189,7 +332,7 @@ def urls_do_texto(doc):
         h = page.rect.height
         for w in page.get_text("words"):
             u = limpar_token(w[4])
-            if re.match(r"https?://", u):
+            if re.match(r"https?://", u) and url_valida(u):
                 d = por_url.setdefault(u, {"pags": set(), "y": 0.0})
                 d["pags"].add(n)
                 d["y"] = max(d["y"], w[1] / h)
@@ -225,7 +368,44 @@ def recuperar_url_completa(doc, url):
             uri_decodificada = unquote(l.get("uri") or "")
             m = padrao.search(uri_decodificada)
             if m:
-                return m.group(0)
+                cand = limpar_token(m.group(0))
+                if not cand.endswith(("…", "...")) and url_valida(cand):
+                    return cand
+    return url
+
+
+def slugificar_titulo(titulo: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", sem_acento(titulo or "").lower()).strip("-")
+
+
+def reconstruir_url_por_titulo(url: str, titulo: str) -> str:
+    if not url or not titulo:
+        return url
+    perfil = obter_perfil_fonte(extrair_dominio(url))
+    if not perfil or not perfil.get("reconstruir_slug"):
+        return url
+    limpa = url.rstrip("…").rstrip(".")
+    if "/" not in limpa.split("://", 1)[-1]:
+        return url
+    base_url, slug_parcial = limpa.rsplit("/", 1)
+    if not slug_parcial:
+        return url
+    slug_completo = slugificar_titulo(titulo)
+    if len(slug_completo) <= len(slug_parcial):
+        return url
+    if slug_completo.startswith(slug_parcial):
+        return f"{base_url}/{slug_completo}/"
+    sp_limpo = slug_parcial.strip("-")
+    sem_stop_p = "-".join(w for w in sp_limpo.split("-") if w and w not in _STOP_SLUG)
+    sem_stop_c = "-".join(w for w in slug_completo.split("-") if w and w not in _STOP_SLUG)
+    if len(sem_stop_p) >= 6 and sem_stop_c.startswith(sem_stop_p):
+        return f"{base_url}/{slug_completo}/"
+    janela = slug_completo[: len(sp_limpo) + 12]
+    if len(sp_limpo) >= 8 and (
+        sp_limpo in janela
+        or difflib.SequenceMatcher(None, sp_limpo, slug_completo[: len(sp_limpo)]).ratio() >= 0.85
+    ):
+        return f"{base_url}/{slug_completo}/"
     return url
 
 
@@ -238,25 +418,12 @@ def recuperar_url_compartilhamento(doc):
         for l in page.get_links():
             m = padrao_share.search(unquote(l.get("uri") or ""))
             if m:
-                return m.group(1)
+                cand = limpar_token(m.group(1))
+                if url_valida(cand):
+                    return cand
     return ""
 
 
-def extrair_dominio(url: str) -> str:
-    if not url:
-        return ""
-    u = re.sub(r"^(https?):/+", r"\1://", url.strip())
-    if "://" not in u:
-        u = "https://" + u
-    return urlparse(u).netloc.lower().removeprefix("www.")
-
-
-_DOMINIOS_IGNORAR = (
-    "doubleclick.net", "googleadservices.com", "adssettings.google.com", "google.com",
-    "catarse.me", "livepix.gg", "paypal.com", "whatsapp.com", "t.me", "twitter.com",
-    "x.com", "facebook.com", "youtube.com", "youtu.be", "linkedin.com", "bsky.app",
-    "creativecommons.org", "lojadoand.com.br", "mobister.com.br", "ajor.org.br",
-)
 _STOP_SLUG = {
     "de", "da", "do", "das", "dos", "em", "no", "na", "nos", "nas", "para", "por",
     "com", "sem", "sob", "sobre", "um", "uma", "ao", "aos", "as", "os", "que", "se",
@@ -268,24 +435,23 @@ def _palavras_slug(s: str) -> set:
 
 
 def recuperar_url_links_pagina(doc, titulo: str, titulo_aba: str = ""):
-    pals = _palavras_slug(titulo) or _palavras_slug(titulo_aba)
+    pals = _palavras_slug(titulo) | _palavras_slug(titulo_aba)
     eh_insta = "instagram" in (titulo_aba or "").lower()
     melhores = []
+    artigos_perfil = []
     por_dom = Counter()
     base_dom = {}
 
     for page in doc:
         for l in page.get_links():
-            u = unquote(l.get("uri") or "").strip()
+            u = limpar_token(unquote(l.get("uri") or "").strip())
             if not u.startswith(("http://", "https://")):
                 continue
-            dom = extrair_dominio(u)
-            if not dom or any(dom == d or dom.endswith("." + d) for d in _DOMINIOS_IGNORAR):
+            if not url_valida(u, permitir_instagram=eh_insta):
                 continue
+            dom = extrair_dominio(u)
             if eh_insta and "instagram.com" in dom and re.search(r"/(?:p|reel)/[A-Za-z0-9_-]+", u):
                 return u, f"https://{dom}/"
-            if "instagram.com" in dom and not eh_insta:
-                continue
             por_dom[dom] += 1
             esquema = urlparse(u).scheme or "https"
             base_dom.setdefault(dom, f"{esquema}://{urlparse(u).netloc}/")
@@ -295,20 +461,223 @@ def recuperar_url_links_pagina(doc, titulo: str, titulo_aba: str = ""):
                 "/",
                 u.split("#")[0],
             )
-            partes_path = [p for p in urlparse(u_limpa).path.split("/") if p]
+            if not url_valida(u_limpa, permitir_instagram=eh_insta):
+                continue
+            parsed = urlparse(u_limpa)
+            caminho = parsed.path or "/"
+            if caminho == "/" or parsed.query.startswith("s="):
+                continue
+
+            perfil = obter_perfil_fonte(dom)
+            ignorar_re = (perfil or {}).get("ignorar_caminhos") or _IGNORAR_CAMINHOS_PADRAO
+            if ignorar_re.search(caminho):
+                continue
+
+            partes_path = [p for p in caminho.split("/") if p]
             slug = partes_path[-1] if partes_path else ""
+            if re.fullmatch(r"a-\d+|\d+", slug) and len(partes_path) >= 2:
+                slug = f"{partes_path[-2]}-{slug}"
             pals_slug = _palavras_slug(slug)
             inter = pals & pals_slug
-            if pals and (len(inter) >= 3 or (len(inter) >= 2 and len(inter) / len(pals) >= 0.5)):
-                melhores.append((len(inter), len(slug), u_limpa))
+            overlap = (len(inter) / len(pals)) if pals else 0.0
+
+            pontos = 0
+            eh_artigo_perfil = bool(perfil and perfil["padrao_artigo"].search(caminho))
+            if eh_artigo_perfil:
+                pontos += 10
+                if u_limpa not in artigos_perfil:
+                    artigos_perfil.append(u_limpa)
+
+            bate_titulo = bool(pals) and (len(inter) >= 2 or overlap >= 0.35)
+            if bate_titulo or (eh_artigo_perfil and len(inter) >= 1):
+                pontos += len(inter) * 5 + int(overlap * 10)
+                melhores.append((pontos, len(inter), len(slug), u_limpa))
 
     if melhores:
         melhores.sort(reverse=True)
-        return melhores[0][2], ""
+        return melhores[0][3], ""
+    if len(artigos_perfil) == 1:
+        return artigos_perfil[0], ""
     if por_dom:
         dom_principal = por_dom.most_common(1)[0][0]
         return "", base_dom[dom_principal]
     return "", ""
+
+
+def coletar_urls_candidatas(doc, permitir_instagram: bool = False) -> list:
+    vistas, prioritarias, com_caminho, raizes = set(), [], [], []
+    for page in doc:
+        for l in page.get_links():
+            u = limpar_token(unquote(l.get("uri") or "").strip())
+            if not u.startswith(("http://", "https://")):
+                continue
+            u_limpa = re.sub(
+                r"/(?:politica-de-privacidade|politica-privacidade|respond|comments)/?$",
+                "/",
+                u.split("#")[0],
+            )
+            if not url_valida(u_limpa, permitir_instagram=permitir_instagram) or u_limpa in vistas:
+                continue
+            vistas.add(u_limpa)
+            parsed = urlparse(u_limpa)
+            caminho = parsed.path or "/"
+            if caminho.strip("/") == "" or parsed.query.startswith("s="):
+                raizes.append(u_limpa)
+                continue
+            perfil = obter_perfil_fonte(extrair_dominio(u_limpa))
+            ignorar_re = (perfil or {}).get("ignorar_caminhos") or _IGNORAR_CAMINHOS_PADRAO
+            if ignorar_re.search(caminho):
+                continue
+            if perfil and perfil["padrao_artigo"].search(caminho):
+                prioritarias.append(u_limpa)
+            else:
+                com_caminho.append(u_limpa)
+    for u in urls_do_texto(doc):
+        if u not in vistas and url_valida(u, permitir_instagram=permitir_instagram):
+            vistas.add(u)
+            com_caminho.append(u)
+    nao_home = prioritarias + com_caminho
+    return (nao_home if nao_home else raizes)[:25]
+
+
+def _chamar_ollama(prompt: str, formato_json: bool = False, modelo: str = "") -> str | None:
+    mod = (modelo or SLM.get("modelo") or "").strip()
+    if not mod:
+        return None
+    payload = {
+        "model": mod,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+    if formato_json:
+        payload["format"] = "json"
+    dados = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        SLM.get("url", "http://localhost:11434/api/generate"),
+        data=dados,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SLM.get("timeout", 20)) as resp:
+            corpo = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if isinstance(corpo, dict):
+                return str(corpo.get("response") or "").strip()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def escolher_url_slm(candidatas: list, titulo: str, texto: str = "", modelo: str = "") -> str:
+    validas = []
+    for u in candidatas or []:
+        u_limpa = limpar_token(str(u).strip())
+        if u_limpa and url_valida(u_limpa) and u_limpa not in validas:
+            validas.append(u_limpa)
+    if not validas:
+        return ""
+    mod = (modelo or SLM.get("modelo") or "qwen2.5:3b").strip()
+    lista_num = "\n".join(f"{i}. {u}" for i, u in enumerate(validas, start=1))
+    trecho = norm(texto)[:600] if texto else ""
+    prompt = (
+        "Você é um classificador de URLs de notícias.\n"
+        f"Título da notícia: {titulo}\n"
+        f"Trecho inicial: {trecho}\n\n"
+        "Escolha na lista abaixo APENAS o número da URL que corresponde à matéria original.\n"
+        "Se nenhuma URL corresponder à matéria específica, responda 0.\n"
+        "Responda SOMENTE com o número inteiro (ex: 1 ou 0), sem texto adicional.\n\n"
+        f"{lista_num}\n"
+    )
+    resp = _chamar_ollama(prompt, formato_json=False, modelo=mod)
+    if not resp:
+        return ""
+    m = re.search(r"\b(\d+)\b", resp)
+    if not m:
+        return ""
+    idx = int(m.group(1))
+    if 1 <= idx <= len(validas):
+        return validas[idx - 1]
+    return ""
+
+
+def extrair_metadados_slm(texto: str, modelo: str = "") -> dict:
+    if not texto or not texto.strip():
+        return {}
+    mod = (modelo or SLM.get("modelo") or "qwen2.5:3b").strip()
+    trecho = texto.strip()[:3000]
+    prompt = (
+        "Extraia os metadados da notícia abaixo e responda ESTRITAMENTE em JSON com as chaves: "
+        '"titulo", "fonte", "data_publicacao" (formato DD/MM/AAAA), '
+        '"hora_publicacao" (formato HH:MM) e "autor". '
+        'Use "" para campos não encontrados.\n\n'
+        f"Texto:\n{trecho}"
+    )
+    resp = _chamar_ollama(prompt, formato_json=True, modelo=mod)
+    if not resp:
+        return {}
+    limpo = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.strip(), flags=re.IGNORECASE)
+    try:
+        dados = json.loads(limpo)
+    except (ValueError, json.JSONDecodeError):
+        m_json = re.search(r"\{.*\}", limpo, flags=re.DOTALL)
+        if not m_json:
+            return {}
+        try:
+            dados = json.loads(m_json.group(0))
+        except (ValueError, json.JSONDecodeError):
+            return {}
+    if not isinstance(dados, dict):
+        return {}
+
+    out = {}
+    for k in ("titulo", "fonte", "autor"):
+        val = dados.get(k)
+        if isinstance(val, str) and norm(val):
+            out[k] = norm(val)
+
+    raw_data = str(dados.get("data_publicacao") or "").strip()
+    m_d = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$", raw_data)
+    if m_d:
+        dt = mk_date(m_d[1], m_d[2], m_d[3])
+        if dt:
+            out["data_publicacao"] = dt
+    else:
+        m_iso = re.match(r"^(20\d{2})-(\d{1,2})-(\d{1,2})$", raw_data)
+        if m_iso:
+            dt = mk_date(m_iso[3], m_iso[2], m_iso[1])
+            if dt:
+                out["data_publicacao"] = dt
+
+    raw_hora = str(dados.get("hora_publicacao") or "").strip()
+    m_h = re.match(r"^(\d{1,2})[:h](\d{2})$", raw_hora, flags=re.IGNORECASE)
+    if m_h and 0 <= int(m_h[1]) <= 23 and 0 <= int(m_h[2]) <= 59:
+        out["hora_publicacao"] = f"{int(m_h[1]):02d}:{m_h[2]}"
+
+    return out
+
+
+def _aplicar_fallback_metadados_slm(linha: dict, texto_p1: str, avisos: list):
+    if not SLM.get("modelo") or not texto_p1.strip():
+        return
+    divergencia = any("difere" in a for a in avisos)
+    faltando = any(not linha.get(c) for c in ("titulo", "data_publicacao", "fonte"))
+    if not (faltando or divergencia):
+        return
+    meta_slm = extrair_metadados_slm(texto_p1)
+    if not meta_slm:
+        return
+    preenchidos = []
+    for campo in ("titulo", "fonte", "data_publicacao", "hora_publicacao"):
+        if not linha.get(campo) and meta_slm.get(campo):
+            linha[campo] = meta_slm[campo]
+            preenchidos.append(campo)
+    if "titulo" in preenchidos:
+        avisos[:] = [a for a in avisos if a != "título não encontrado"]
+    if "data_publicacao" in preenchidos:
+        avisos[:] = [a for a in avisos if a != "data de publicação não encontrada"]
+    if preenchidos:
+        avisos.append(f"metadados preenchidos via SLM ({', '.join(preenchidos)}): conferir")
 
 
 def dividir_titulo_fonte(titulo_completo):
@@ -595,14 +964,17 @@ def ocr_regiao(page, clip, n_pag, pt, lang, dpi=OCR_DPI, config="", variante=Non
 
 
 def limpar_token(t):
-    return t.strip("([<“\"'").rstrip(".,;:)]}>”\"'»")
+    s = t.strip("([<“\"'").rstrip(",;:)]}>”\"'»")
+    if s.endswith(("...", "…")):
+        return s
+    return s.rstrip(".")
 
 
 def tokens_url(linhas):
     for l in linhas:
         for w in l["palavras"]:
             tok = limpar_token(w["texto"])
-            if len(tok) >= 12 and RE_URL_OCR.match(tok):
+            if len(tok) >= 12 and RE_URL_OCR.match(tok) and url_valida(tok):
                 yield tok, w, l
 
 
@@ -657,7 +1029,7 @@ def url_do_ocr(linhas):
     for i, l in enumerate(linhas):
         for w in l["palavras"]:
             tok = limpar_token(w["texto"])
-            if len(tok) >= 12 and RE_URL_OCR.match(tok):
+            if len(tok) >= 12 and RE_URL_OCR.match(tok) and url_valida(tok):
                 borda = l["top"] < 0.1 * l["h_pag"] or l["bot"] > 0.9 * l["h_pag"]
                 cortada = w["x1"] >= l["clip_x1"] - 5
                 c = cands.setdefault(tok, {"url": tok, "conf": 0, "votos": 0, "borda": False,
@@ -673,7 +1045,7 @@ def url_do_ocr(linhas):
                     if (prox["pag"] == l["pag"] and prox["top"] - l["bot"] < 2 * max(l["altura"], 6)
                             and RE_RESTO_URL.match(p0) and not RE_URL_OCR.match(p0)):
                         c["continua"] = p0
-            elif RE_PARECE_LINK.search(tok) and tok not in suspeitos:
+            elif RE_PARECE_LINK.search(tok) and url_valida(tok) and tok not in suspeitos:
                 suspeitos.append(tok)
 
     ordem = sorted(cands.values(), key=lambda c: (not c["borda"], -c["votos"], -c["conf"], -len(c["url"])))
@@ -852,6 +1224,14 @@ def extrair_escaneado(doc, linha, pdf_path):
     if not titulo:
         avisos.append("título não encontrado")
 
+    if url.endswith(("…", "...")):
+        reconstruida = reconstruir_url_por_titulo(url, titulo or titulo_meta)
+        if reconstruida != url:
+            nome_f = nome_fonte_dominio(extrair_dominio(reconstruida)) or extrair_dominio(reconstruida)
+            url = reconstruida
+            url_origem = f"rodapé + título ({nome_f})"
+            avisos.append(f"URL cortada no rodapé; reconstruída pelo título ({nome_f}): conferir")
+
     texto = "\n".join(l["texto"] for l in corpo)
     data_pub, hora_pub = ler_data_publicacao(texto)
     if not data_pub and len(doc) > 1:
@@ -877,49 +1257,15 @@ def extrair_escaneado(doc, linha, pdf_path):
     dominio = extrair_dominio(url)
     linha.update({
         "titulo": titulo,
-        "fonte": next((n for d, n in NOMES_FONTE.items() if dominio.endswith(d)), "") or sufixo or dominio,
+        "fonte": nome_fonte_dominio(dominio) or sufixo or dominio,
         "data_publicacao": data_pub,
         "hora_publicacao": hora_pub,
         "url": url,
         "url_origem": url_origem,
-        "data_impressao": data_imp,
-        "avisos": "; ".join(avisos),
     })
+    _aplicar_fallback_metadados_slm(linha, texto, avisos)
+    linha["avisos"] = "; ".join(avisos)
     return linha
-
-
-def parse_agencia_brasil(doc, titulo, linhas):
-    out = {}
-    i_pub = next((i for i, l in enumerate(linhas) if l.startswith("Publicado em")), None)
-    if i_pub is None or i_pub == 0:
-        return out
-
-    byline = linhas[i_pub - 1]
-    nome, _, cargo = byline.partition(" - ")
-    out["autor"] = nome.title() if nome.isupper() else nome
-    if cargo.isupper():
-        cargo = re.sub(r"\b(Da|De|Do|Das|Dos)\b", lambda m: m[0].lower(), cargo.title())
-    out["cargo_autor"] = cargo
-    if i_pub + 1 < len(linhas) and len(linhas[i_pub + 1]) <= 40:
-        out["local"] = linhas[i_pub + 1]
-
-    pos = achar_titulo(linhas, titulo)
-    if pos:
-        s, e = pos
-        if s > 0:
-            out["editoria"] = linhas[s - 1]
-        out["subtitulo"] = " ".join(linhas[e + 1:i_pub - 1])
-
-    texto = "\n".join(p.get_text() for p in doc)
-    m = re.search(r"Edição:\s*(.+)", texto)
-    if m:
-        out["edicao"] = norm(m[1])
-    return out
-
-
-PARSERS_SITE = {
-    "agenciabrasil.ebc.com.br": parse_agencia_brasil,
-}
 
 
 def abrir_pdf(p: Path):
@@ -936,14 +1282,14 @@ def extrair(pdf_path: Path, raiz: Path) -> dict:
     DEBUG["pdf"] = re.sub(r"[^\w.-]+", "_", f"{pasta_relativa(pdf_path, raiz)}_{pdf_path.stem}").strip("_")
     with abrir_pdf(pdf_path) as doc:
         avisos = []
-        linha = linha_base(pdf_path, raiz, len(doc))
+        linha = linha_base(pdf_path, raiz)
 
         if sem_camada_de_texto(doc):
             return extrair_escaneado(doc, linha, pdf_path)
 
         p1 = doc[0]
         ctx = contexto(doc)
-        data_imp, titulo_cab = ler_cabecalho(p1)
+        _, titulo_cab = ler_cabecalho(p1)
         titulo_completo = titulo_metadados(doc) or titulo_cab
         titulo_aba, sufixo = dividir_titulo_fonte(titulo_completo)
 
@@ -956,12 +1302,24 @@ def extrair(pdf_path: Path, raiz: Path) -> dict:
             if titulo:
                 avisos.append("título vindo da aba do navegador (nenhum destaque detectado na página)")
 
+        corpo_p1 = linhas_corpo(p1, ctx)
+        texto_p1 = "\n".join(corpo_p1)
+
         url, url_origem = ler_url_rodape(doc, ctx), "rodapé do PDF"
         if url.endswith(("…", "...")):
             completa = recuperar_url_completa(doc, url)
-            avisos.append("URL cortada no rodapé; recuperada pelos links" if completa != url
-                          else "URL cortada no rodapé; conferir manualmente")
-            url = completa
+            if completa != url:
+                url = completa
+                avisos.append("URL cortada no rodapé; recuperada pelos links")
+            else:
+                reconstruida = reconstruir_url_por_titulo(url, titulo or titulo_aba)
+                if reconstruida != url:
+                    nome_f = nome_fonte_dominio(extrair_dominio(reconstruida)) or extrair_dominio(reconstruida)
+                    url = reconstruida
+                    url_origem = f"rodapé + título ({nome_f})"
+                    avisos.append(f"URL cortada no rodapé; reconstruída pelo título ({nome_f}): conferir")
+                else:
+                    avisos.append("URL cortada no rodapé; conferir manualmente")
         if not url:
             url_share = recuperar_url_compartilhamento(doc)
             if url_share:
@@ -971,14 +1329,23 @@ def extrair(pdf_path: Path, raiz: Path) -> dict:
         if not url and url_link_mat:
             url, url_origem = url_link_mat, "link da página"
             avisos.append("URL sem rodapé; recuperada dos links clicáveis da página: conferir")
+        if not url and SLM.get("modelo"):
+            cands = coletar_urls_candidatas(doc, permitir_instagram="instagram" in (titulo_aba or "").lower())
+            eh_fonte_mapeada = bool(obter_perfil_fonte(extrair_dominio(url_dom_links)))
+            if len(cands) >= 2 or (eh_fonte_mapeada and len(cands) >= 1):
+                url_slm = escolher_url_slm(cands, titulo or titulo_aba, texto_p1)
+                if url_slm:
+                    url, url_origem = url_slm, "link da página (SLM)"
+                    avisos.append("URL sem rodapé; escolhida entre os links da página via SLM: conferir")
         if not url:
             url = url_do_corpo(doc)
             if url:
                 url_origem = "texto do PDF (conferir)"
                 avisos.append("URL tirada do corpo do texto, não do rodapé: pode não ser a do artigo")
         if not url and url_dom_links:
-            url, url_origem = url_dom_links, "domínio do site (links do PDF)"
-            avisos.append("PDF impresso sem rodapé; preenchido com o domínio principal dos links da página")
+            url = url_dom_links
+            url_origem = "home do site (link da matéria não encontrado no PDF)"
+            avisos.append("PDF impresso sem rodapé; link específico da matéria não encontrado, preenchido com a home do site")
         if not url:
             pt, lang, _ = ocr_pronto()
             try:
@@ -1001,10 +1368,9 @@ def extrair(pdf_path: Path, raiz: Path) -> dict:
             url_origem = ""
 
         dominio = extrair_dominio(url)
-        fonte = next((n for d, n in NOMES_FONTE.items() if dominio.endswith(d)), "") or sufixo or dominio
+        fonte = nome_fonte_dominio(dominio) or sufixo or dominio
 
-        corpo_p1 = linhas_corpo(p1, ctx)
-        data_pub, hora_pub = ler_data_publicacao("\n".join(corpo_p1))
+        data_pub, hora_pub = ler_data_publicacao(texto_p1)
         if not data_pub and len(doc) > 1:
             topo2 = [l["texto"] for l in linhas_dict(doc[1])
                      if l["bot"] <= doc[1].rect.height - MOLDURA_PT][:12]
@@ -1012,7 +1378,7 @@ def extrair(pdf_path: Path, raiz: Path) -> dict:
             if data_pub:
                 avisos.append("data de publicação lida na 2ª página")
         if not data_pub:
-            data_pub, hora_pub = ler_data_solta("\n".join(corpo_p1))
+            data_pub, hora_pub = ler_data_solta(texto_p1)
             if data_pub:
                 avisos.append("data lida sem 'Publicado em' (primeira data da página): conferir")
         if not data_pub:
@@ -1036,25 +1402,16 @@ def extrair(pdf_path: Path, raiz: Path) -> dict:
             "hora_publicacao": hora_pub,
             "url": url,
             "url_origem": url_origem,
-            "tags": "; ".join(ler_tags(doc)),
-            "data_impressao": data_imp,
         })
 
-        parser = next((f for d, f in PARSERS_SITE.items() if dominio.endswith(d)), None)
-        if parser:
-            linha.update(parser(doc, titulo, corpo_p1))
-        elif dominio:
-            avisos.append(f"sem parser específico para {dominio} (só campos genéricos)")
-
+        _aplicar_fallback_metadados_slm(linha, texto_p1, avisos)
         linha["avisos"] = "; ".join(avisos)
         return linha
 
 
 COLUNAS = [
     "codigo", "pasta", "pasta_1", "pasta_2", "pasta_3", "titulo", "fonte", "data_publicacao",
-    "hora_publicacao", "url", "url_origem", "editoria", "autor", "cargo_autor", "local",
-    "subtitulo", "edicao", "tags", "data_impressao", "paginas", "avisos", "revisado",
-    "arquivo", "caminho_pdf",
+    "hora_publicacao", "url", "url_origem",
 ]
 
 
@@ -1066,27 +1423,18 @@ def salvar_planilha(linhas, saida):
     for c in COLUNAS:
         if c not in df:
             df[c] = ""
-        elif c not in ("data_publicacao", "data_impressao", "paginas"):
+        elif c != "data_publicacao":
             df[c] = df[c].fillna("")
-    df["revisado"] = ""
 
-    eh_dom = df["url_origem"].str.startswith("domínio")
-    dup = df["url"].ne("") & (~eh_dom) & df["url"].duplicated(keep=False)
-    for _, g in df[dup].groupby("url"):
-        for i in g.index:
-            outros = [(f"{df.at[j, 'pasta']}/{df.at[j, 'codigo']}").strip("/") for j in g.index if j != i]
-            df.at[i, "avisos"] = (df.at[i, "avisos"] + "; URL duplicada (também em: "
-                                  + ", ".join(outros[:3]) + ")").strip("; ")
-    for c in ("data_publicacao", "data_impressao"):
-        df[c] = pd.to_datetime(df[c], errors="coerce")
+    df["data_publicacao"] = pd.to_datetime(df["data_publicacao"], errors="coerce")
     df = df[COLUNAS]
     df = df.apply(lambda col: col.map(
         lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v))
 
-    resumo = (df.assign(com_url=df["url"].ne(""), sem_url=df["url"].eq(""), com_aviso=df["avisos"].ne(""))
+    resumo = (df.assign(com_url=df["url"].ne(""), sem_url=df["url"].eq(""))
               .groupby("pasta", sort=False)
               .agg(pdfs=("codigo", "size"), com_url=("com_url", "sum"),
-                   sem_url=("sem_url", "sum"), com_aviso=("com_aviso", "sum"))
+                   sem_url=("sem_url", "sum"))
               .reset_index())
     resumo["pasta"] = resumo["pasta"].replace("", "(raiz)")
 
@@ -1098,25 +1446,20 @@ def salvar_planilha(linhas, saida):
         ws.auto_filter.ref = ws.dimensions
         larguras = {"codigo": 16, "pasta": 24, "pasta_1": 16, "pasta_2": 16, "pasta_3": 16,
                     "titulo": 60, "fonte": 18, "data_publicacao": 16,
-                    "hora_publicacao": 12, "url": 50, "url_origem": 22, "editoria": 18, "autor": 20,
-                    "cargo_autor": 24, "local": 18, "subtitulo": 50, "edicao": 16,
-                    "tags": 36, "data_impressao": 16, "paginas": 9, "avisos": 40,
-                    "revisado": 10, "arquivo": 24, "caminho_pdf": 30}
+                    "hora_publicacao": 12, "url": 50, "url_origem": 22}
         for i, nome in enumerate(COLUNAS, start=1):
             ws.column_dimensions[ws.cell(1, i).column_letter].width = larguras.get(nome, 16)
             ws.cell(1, i).font = Font(bold=True)
         wr = xw.sheets["Resumo"]
-        for col, w in zip("ABCDE", (40, 10, 10, 10, 10)):
+        for col, w in zip("ABCD", (40, 10, 10, 10)):
             wr.column_dimensions[col].width = w
         for c in wr[1]:
             c.font = Font(bold=True)
-        colunas_data = [COLUNAS.index(n) + 1 for n in ("data_publicacao", "data_impressao")]
+        i_data = COLUNAS.index("data_publicacao") + 1
         i_url = COLUNAS.index("url") + 1
-        i_pdf = COLUNAS.index("caminho_pdf") + 1
         vermelho = PatternFill("solid", fgColor="FFC7CE")
         for r in range(2, ws.max_row + 1):
-            for ci in colunas_data:
-                ws.cell(r, ci).number_format = "DD/MM/YYYY"
+            ws.cell(r, i_data).number_format = "DD/MM/YYYY"
             c = ws.cell(r, i_url)
             if c.value:
                 val = str(c.value).strip()
@@ -1124,13 +1467,6 @@ def salvar_planilha(linhas, saida):
                 c.font = Font(color="0563C1", underline="single")
             else:
                 c.fill = vermelho
-            p = ws.cell(r, i_pdf)
-            if p.value:
-                try:
-                    p.hyperlink = Path(str(p.value)).as_uri()
-                    p.font = Font(color="0563C1", underline="single")
-                except ValueError:
-                    pass
     return df
 
 
@@ -1140,8 +1476,11 @@ def main():
     ap.add_argument("saida", help="planilha de saída (.xlsx)")
     ap.add_argument("--debug-ocr", metavar="PASTA",
                     help="salva nesta pasta os recortes (já pré-processados) que o OCR leu")
+    ap.add_argument("--modelo-slm", metavar="MODELO", default="",
+                    help="modelo Ollama local usado como fallback (ex.: qwen2.5:3b, llama3.2:3b)")
     args = ap.parse_args()
     DEBUG["dir"] = args.debug_ocr
+    SLM["modelo"] = args.modelo_slm.strip()
 
     pasta, saida = Path(args.entrada), args.saida
     if pasta.is_file():
@@ -1181,8 +1520,7 @@ def main():
         df = salvar_planilha(linhas, saida)
 
     sem_url = int(df["url"].eq("").sum())
-    com_aviso = int(df["avisos"].astype(bool).sum())
-    print(f"{len(df)} PDFs processados -> {saida} ({sem_url} sem URL, {com_aviso} com avisos para conferir)")
+    print(f"{len(df)} PDFs processados -> {saida} ({sem_url} sem URL)")
 
 
 if __name__ == "__main__":
